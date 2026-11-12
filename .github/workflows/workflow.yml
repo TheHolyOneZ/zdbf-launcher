@@ -1,0 +1,317 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Create a draft release for the version in package.json
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+
+jobs:
+  check:
+    name: Lint, types and tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev patchelf file
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: check
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Bundled uv
+        run: node scripts/fetch-uv.mjs
+
+      - name: Frontend build
+        run: pnpm build
+
+      - name: Rust format
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test --locked
+
+  provisioning:
+    name: Python setup on ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+          - name: Windows
+            os: windows-latest
+            triple: x86_64-pc-windows-msvc
+          - name: macOS Apple Silicon
+            os: macos-latest
+            triple: aarch64-apple-darwin
+          - name: macOS Intel
+            os: macos-15-intel
+            triple: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Bundled uv
+        run: node scripts/fetch-uv.mjs ${{ matrix.triple }}
+
+      - name: Install ZDBF with the bundled uv and Python
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/smoke.mjs
+
+  release:
+    name: Draft release
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release) }}
+    needs: check
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.draft.outputs.id }}
+      tag: ${{ steps.draft.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Versions match
+        shell: bash
+        run: |
+          app="$(node -p "require('./package.json').version")"
+          conf="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          crate="$(grep -m1 '^version' src-tauri/Cargo.toml | cut -d '"' -f2)"
+          echo "package.json $app, tauri.conf.json $conf, Cargo.toml $crate"
+          if [ "$app" != "$conf" ] || [ "$app" != "$crate" ]; then
+            echo "::error::Raise the version in package.json, src-tauri/tauri.conf.json and src-tauri/Cargo.toml together."
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v$app" ]; then
+            echo "::error::The tag ${GITHUB_REF_NAME} does not match the app version v$app."
+            exit 1
+          fi
+
+      - name: Signing key is set
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEY" ] || [ -z "$PASSWORD" ]; then
+            echo "::error::Add the repository secrets TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD first."
+            exit 1
+          fi
+
+      - name: Create or reuse the draft
+        id: draft
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = require("./package.json").version;
+            const tag = `v${version}`;
+            const { owner, repo } = context.repo;
+            const all = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
+            let release = all.find((r) => r.tag_name === tag);
+            if (release && !release.draft) {
+              core.setFailed(`${tag} is already published. Raise the version for a new release.`);
+              return;
+            }
+            if (!release) {
+              const body = [
+                "## Downloads",
+                "",
+                "| System | File |",
+                "|---|---|",
+                `| Windows 10 and 11 | \`ZDBF Launcher_${version}_x64-setup.exe\` |`,
+                `| macOS 11 or newer, Apple Silicon and Intel | \`ZDBF Launcher_${version}_universal.dmg\` |`,
+                `| Linux, any distribution | \`ZDBF Launcher_${version}_amd64.AppImage\` |`,
+                `| Debian, Ubuntu, Linux Mint | \`ZDBF Launcher_${version}_amd64.deb\` |`,
+                "",
+                "The installers are not signed with a paid Apple or Microsoft certificate. How to open them the first time: see [Opening it for the first time](https://github.com/TheHolyOneZ/zdbf-launcher#opening-it-for-the-first-time).",
+                "",
+                "## What changed",
+                "",
+                "- ",
+              ].join("\n");
+              release = (
+                await github.rest.repos.createRelease({
+                  owner,
+                  repo,
+                  tag_name: tag,
+                  target_commitish: context.sha,
+                  name: `ZDBF Launcher ${tag}`,
+                  body,
+                  draft: true,
+                  prerelease: false,
+                })
+              ).data;
+            }
+            core.setOutput("id", String(release.id));
+            core.setOutput("tag", tag);
+
+  build:
+    name: Build for ${{ matrix.name }}
+    needs: [check, release]
+    if: ${{ !cancelled() && needs.check.result == 'success' && (needs.release.result == 'success' || needs.release.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            rust: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+          - name: Windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rust: x86_64-pc-windows-msvc
+            bundles: nsis
+          - name: macOS
+            os: macos-latest
+            target: universal-apple-darwin
+            rust: aarch64-apple-darwin,x86_64-apple-darwin
+            bundles: app,dmg
+    runs-on: ${{ matrix.os }}
+    env:
+      HAS_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev patchelf file xdg-utils
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.target }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Bundled uv
+        run: node scripts/fetch-uv.mjs ${{ matrix.target }}
+
+      - name: Updater signing
+        id: sign
+        run: |
+          if [ "$HAS_KEY" = "true" ]; then
+            echo "args=" >> "$GITHUB_OUTPUT"
+            echo "Updater artifacts are signed with the repository key."
+          else
+            echo '{"bundle":{"createUpdaterArtifacts":false}}' > ci-unsigned.json
+            echo "args=--config ci-unsigned.json" >> "$GITHUB_OUTPUT"
+            echo "No signing key in this run: building without updater artifacts."
+          fi
+
+      - name: Build
+        id: tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ needs.release.outputs.id }}
+          includeUpdaterJson: true
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} ${{ steps.sign.outputs.args }}
+
+      - name: Linux binary runs on Ubuntu 22.04 and newer
+        if: runner.os == 'Linux'
+        run: |
+          bin="src-tauri/target/${{ matrix.target }}/release/zdbf-launcher"
+          need="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)"
+          echo "The binary needs $need"
+          if [ "$(printf '%s\n' "$need" GLIBC_2.35 | sort -V | tail -1)" != "GLIBC_2.35" ]; then
+            echo "::error::$need is newer than the glibc 2.35 of Ubuntu 22.04."
+            exit 1
+          fi
+
+      - name: Collect the installers
+        run: |
+          bundle="src-tauri/target/${{ matrix.target }}/release/bundle"
+          mkdir -p out
+          case "$RUNNER_OS" in
+            Linux) cp "$bundle"/appimage/*.AppImage "$bundle"/deb/*.deb out/ ;;
+            Windows) cp "$bundle"/nsis/*-setup.exe out/ ;;
+            macOS) cp "$bundle"/dmg/*.dmg out/ ;;
+          esac
+          cd out
+          if command -v sha256sum >/dev/null; then sha256sum -- * > "SHA256SUMS-${{ matrix.name }}.txt"; else shasum -a 256 -- * > "SHA256SUMS-${{ matrix.name }}.txt"; fi
+          ls -la
+          cat SHA256SUMS-*.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zdbf-launcher-${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30

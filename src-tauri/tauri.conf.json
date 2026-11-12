@@ -1,0 +1,80 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "ZDBF Launcher",
+  "version": "0.1.0",
+  "identifier": "eu.zsync.zdbf-launcher",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "node scripts/fetch-uv.mjs && pnpm dev",
+    "beforeBuildCommand": "node scripts/fetch-uv.mjs && pnpm build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "ZDBF Launcher",
+        "width": 1180,
+        "height": 780,
+        "minWidth": 880,
+        "minHeight": 600,
+        "resizable": true,
+        "visible": false,
+        "center": true,
+        "decorations": false,
+        "shadow": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; font-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/zdbf-uv"
+    ],
+    "category": "Utility",
+    "shortDescription": "Run and manage ZDBF V2 Discord bots",
+    "longDescription": "Installs, runs, configures and updates ZDBF V2 Discord bots, with a local web dashboard.",
+    "copyright": "Copyright 2026 TheHolyOneZ",
+    "license": "Apache-2.0",
+    "publisher": "TheHolyOneZ",
+    "homepage": "https://zsync.eu/zdbf",
+    "createUpdaterArtifacts": true,
+    "linux": {
+      "deb": {
+        "depends": []
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      },
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-"
+    }
+  },
+  "mainBinaryName": "zdbf-launcher",
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY0M0FDNDU0QjgxOUZCQTIKUldTaSt4bTRWTVE2Wkw4d1p1QUx1c0orcTRIZFZ0c2t1WjNqdW1jRThxVk84aWZjQllXbkUzd2UK",
+      "endpoints": [
+        "https://github.com/TheHolyOneZ/zdbf-launcher/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}
